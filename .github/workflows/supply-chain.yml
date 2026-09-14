@@ -21,11 +21,20 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PDF Generation Tools
+        run: |
+          pip install jinja2 weasyprint
+
       # 1. Install dependencies so node_modules exists
       - name: Install Dependencies
         run: npm install --legacy-peer-deps --ignore-scripts
 
-      # 2. Install Syft and Grype CLIs directly (bypasses GitHub Action wrapper bugs)
+      # 2. Install Syft and Grype CLIs directly
       - name: Install Syft and Grype CLIs
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
@@ -42,12 +51,155 @@ jobs:
           name: juiceshop-sbom
           path: juiceshop.sbom.json
 
-      # 5. Scan the complete SBOM with Grype and output a valid SARIF file
+      # 5. Scan the complete SBOM with Grype and output SARIF and JSON
       - name: Scan SBOM with Grype
-        run: grype sbom:juiceshop.sbom.json -o sarif > results.sarif
+        run: |
+          grype sbom:juiceshop.sbom.json -o sarif > results.sarif
+          grype sbom:juiceshop.sbom.json -o json > grype-results.json
         continue-on-error: true
 
-      # 6. Upload SARIF results to GitHub Security tab
+      # 6. Generate PDF Report from Grype JSON
+      - name: Generate PDF Report
+        run: |
+          cat << 'EOF' > generate_pdf.py
+          import json
+          from weasyprint import HTML
+
+          with open('grype-results.json', 'r') as f:
+              data = json.load(f)
+
+          matches = data.get('matches', [])
+          rows = []
+
+          for match in matches:
+              vuln = match.get('vulnerability', {})
+              artifact = match.get('artifact', {})
+              
+              # Extract details matching the table format
+              cve_id = vuln.get('id', 'N/A')
+              
+              # Get GHSA/Related ID if available
+              related = vuln.get('relatedVulnerabilities', [])
+              ghsa_id = related[0].get('id', 'N/A') if related else 'N/A'
+              
+              severity = vuln.get('severity', 'Unknown').capitalize()
+              package_name = artifact.get('name', 'N/A')
+              installed_version = artifact.get('version', 'N/A')
+              
+              # Extract Fix Version
+              fix_versions = vuln.get('fix', {}).get('versions', [])
+              fix_version = ", ".join(fix_versions) if fix_versions else "N/A"
+
+              rows.append({
+                  'cve_id': cve_id,
+                  'ghsa_id': ghsa_id,
+                  'severity': severity,
+                  'package': package_name,
+                  'installed_version': installed_version,
+                  'fix_version': fix_version
+              })
+
+          html_content = f"""
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <style>
+                  body {{
+                      font-family: Arial, Helvetica, sans-serif;
+                      margin: 30px;
+                      color: #333;
+                  }}
+                  h1 {{
+                      font-size: 28px;
+                      font-weight: bold;
+                      margin-bottom: 25px;
+                  }}
+                  table {{
+                      width: 100%;
+                      border-collapse: collapse;
+                  }}
+                  th, td {{
+                      padding: 10px 12px;
+                      text-align: left;
+                      font-size: 13px;
+                  }}
+                  th {{
+                      background-color: #f4f4f4;
+                      font-weight: bold;
+                      border-bottom: 2px solid #ccc;
+                  }}
+                  tr {{
+                      border-bottom: 1px solid #e0e0e0;
+                  }}
+                  .cve {{
+                      font-weight: bold;
+                  }}
+                  .severity-high {{
+                      color: #e67e22;
+                      font-weight: bold;
+                  }}
+                  .severity-critical {{
+                      color: #c0392b;
+                      font-weight: bold;
+                  }}
+                  .severity-medium {{
+                      color: #f39c12;
+                  }}
+                  .severity-low {{
+                      color: #27ae60;
+                  }}
+              </style>
+          </head>
+          <body>
+              <h1>Grype Vulnerability Report</h1>
+              <table>
+                  <thead>
+                      <tr>
+                          <th>CVE ID</th>
+                          <th>GHSA / Original ID</th>
+                          <th>Severity</th>
+                          <th>Package</th>
+                          <th>Installed Version</th>
+                          <th>Fix Version</th>
+                      </tr>
+                  </thead>
+                  <tbody>
+          """
+
+          for row in rows:
+              sev_class = f"severity-{row['severity'].lower()}"
+              html_content += f"""
+                      <tr>
+                          <td class="cve">{row['cve_id']}</td>
+                          <td>{row['ghsa_id']}</td>
+                          <td class="{sev_class}">{row['severity']}</td>
+                          <td>{row['package']}</td>
+                          <td>{row['installed_version']}</td>
+                          <td>{row['fix_version']}</td>
+                      </tr>
+              """
+
+          html_content += """
+                  </tbody>
+              </table>
+          </body>
+          </html>
+          """
+
+          HTML(string=html_content).write_pdf('grype-report.pdf')
+          print("PDF report generated successfully: grype-report.pdf")
+          EOF
+
+          python generate_pdf.py
+
+      # 7. Upload PDF Artifact
+      - name: Upload PDF Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-vulnerability-report-pdf
+          path: grype-report.pdf
+
+      # 8. Upload SARIF results to GitHub Security tab
       - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
